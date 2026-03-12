@@ -23,6 +23,7 @@ from emg2qwerty.charset import charset
 from emg2qwerty.data import LabelData, WindowedEMGDataset
 from emg2qwerty.metrics import CharacterErrorRates
 from emg2qwerty.modules import (
+    CNNEncoder,
     MultiBandRotationInvariantMLP,
     SpectrogramNorm,
     TDSConvEncoder,
@@ -43,6 +44,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         train_transform: Transform[np.ndarray, torch.Tensor],
         val_transform: Transform[np.ndarray, torch.Tensor],
         test_transform: Transform[np.ndarray, torch.Tensor],
+        test_window_length: int | None = None,
     ) -> None:
         super().__init__()
 
@@ -59,6 +61,9 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         self.train_transform = train_transform
         self.val_transform = val_transform
         self.test_transform = test_transform
+        # When set, use windowed evaluation at test time instead of full session.
+        # Useful when full sessions are too large to fit in RAM.
+        self.test_window_length = test_window_length
 
     def setup(self, stage: str | None = None) -> None:
         self.train_dataset = ConcatDataset(
@@ -85,15 +90,14 @@ class WindowedEMGDataModule(pl.LightningDataModule):
                 for hdf5_path in self.val_sessions
             ]
         )
+        test_wlen = self.test_window_length  # None = full session, int = windowed
         self.test_dataset = ConcatDataset(
             [
                 WindowedEMGDataset(
                     hdf5_path,
                     transform=self.test_transform,
-                    # Feed the entire session at once without windowing/padding
-                    # at test time for more realism
-                    window_length=None,
-                    padding=(0, 0),
+                    window_length=test_wlen,
+                    padding=self.padding if test_wlen is not None else (0, 0),
                     jitter=False,
                 )
                 for hdf5_path in self.test_sessions
@@ -123,13 +127,12 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         )
 
     def test_dataloader(self) -> DataLoader:
-        # Test dataset does not involve windowing and entire sessions are
-        # fed at once. Limit batch size to 1 to fit within GPU memory and
-        # avoid any influence of padding (while collating multiple batch items)
-        # in test scores.
+        # When test_window_length is None, entire sessions are fed at once so
+        # batch_size must be 1. When windowed, use the normal batch_size.
+        test_batch_size = self.batch_size if self.test_window_length is not None else 1
         return DataLoader(
             self.test_dataset,
-            batch_size=1,
+            batch_size=test_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
@@ -588,6 +591,215 @@ class TransformerCTCModule(pl.LightningModule):
 
     def test_step(self, *args, **kwargs) -> torch.Tensor:
         return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+class CNNRNNCTCModule(pl.LightningModule):
+    """A CNN + RNN hybrid model for sEMG-to-keystroke decoding with CTC loss.
+
+    Architecture:
+      SpectrogramNorm -> MultiBandRotationInvariantMLP -> CNNEncoder -> GRU -> Linear
+
+    The CNN extracts local temporal patterns from the EMG spectrogram features,
+    while the bidirectional GRU captures long-range sequential context needed
+    for CTC decoding. This combination leverages the spatial feature extraction
+    strength of CNNs and the sequence modelling ability of RNNs.
+    """
+
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        cnn_channels: int,
+        cnn_kernel_size: int,
+        cnn_num_layers: int,
+        cnn_dropout: float,
+        rnn_hidden_size: int,
+        rnn_num_layers: int,
+        rnn_dropout: float,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        test_chunk_frames: int = 4000,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        rnn_dropout = rnn_dropout if rnn_num_layers > 1 else 0.0
+
+        # Frontend: normalize spectrogram and embed per-band electrode features
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.spectrogram_norm = SpectrogramNorm(
+            channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS
+        )
+        self.rotation_invariant_mlp = MultiBandRotationInvariantMLP(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            num_bands=self.NUM_BANDS,
+        )
+
+        # CNN: extract local temporal features
+        # (T, N, num_features) -> (T', N, cnn_channels)
+        self.cnn_encoder = CNNEncoder(
+            num_features=num_features,
+            channels=cnn_channels,
+            kernel_size=cnn_kernel_size,
+            num_layers=cnn_num_layers,
+            dropout=cnn_dropout,
+        )
+
+        # RNN: capture long-range sequential context
+        # (T', N, cnn_channels) -> (T', N, 2 * rnn_hidden_size)
+        self.rnn = nn.GRU(
+            input_size=cnn_channels,
+            hidden_size=rnn_hidden_size,
+            num_layers=rnn_num_layers,
+            dropout=rnn_dropout,
+            bidirectional=True,
+        )
+
+        # Classifier head
+        # (T', N, 2 * rnn_hidden_size) -> (T', N, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * rnn_hidden_size, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+        self.decoder = instantiate(decoder)
+
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x = self.spectrogram_norm(inputs)       # (T, N, bands, C, freq)
+        x = self.rotation_invariant_mlp(x)      # (T, N, bands, mlp_features[-1])
+        x = x.flatten(start_dim=2)              # (T, N, num_features)
+        x = self.cnn_encoder(x)                 # (T', N, cnn_channels)
+        x, _ = self.rnn(x)                      # (T', N, 2*rnn_hidden_size)
+        return self.classifier(x)               # (T', N, num_classes)
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)
+
+        emissions = self.forward(inputs)
+
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
+        )
+
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def _forward_chunked(self, inputs: torch.Tensor) -> torch.Tensor:
+        """Process a long sequence in non-overlapping chunks to avoid OOM.
+
+        Each chunk is forwarded independently through the full model and the
+        resulting emission sequences are concatenated. Chunks too short for
+        the CNN to produce any output are skipped.
+        """
+        chunk_size = self.hparams.test_chunk_frames
+        min_frames = (self.hparams.cnn_kernel_size - 1) * self.hparams.cnn_num_layers + 1
+        emission_chunks = []
+        for start in range(0, inputs.shape[0], chunk_size):
+            chunk = inputs[start : start + chunk_size]
+            if chunk.shape[0] < min_frames:
+                continue
+            emission_chunks.append(self.forward(chunk))
+        return torch.cat(emission_chunks, dim=0)
+
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, batch: dict[str, torch.Tensor], *args, **kwargs) -> torch.Tensor:
+        # Full sessions are fed at test time; use chunked forward to avoid OOM.
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)
+
+        emissions = self._forward_chunked(inputs)
+
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,
+            targets=targets.transpose(0, 1),
+            input_lengths=emission_lengths,
+            target_lengths=target_lengths,
+        )
+
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        metrics = self.metrics["test_metrics"]
+        targets_np = targets.detach().cpu().numpy()
+        target_lengths_np = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            target = LabelData.from_labels(targets_np[: target_lengths_np[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log("test/loss", loss, batch_size=N, sync_dist=True)
+        return loss
 
     def on_train_epoch_end(self) -> None:
         self._epoch_end("train")

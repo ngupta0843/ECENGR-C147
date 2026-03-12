@@ -1,0 +1,24 @@
+# @package _global_
+module:
+  _target_: emg2qwerty.lightning.CNNRNNCTCModule
+  in_features: 528  # freq * channels = (n_fft // 2 + 1) * 16
+  mlp_features: [384]
+  # CNN encoder: 4 causal Conv1d layers with kernel_size=5
+  # Each layer shrinks T by 4; total T_diff = 16 frames at 125 Hz = ~128ms
+  cnn_channels: 256
+  cnn_kernel_size: 5
+  cnn_num_layers: 4
+  cnn_dropout: 0.1
+  # Bidirectional GRU
+  rnn_hidden_size: 256
+  rnn_num_layers: 2
+  rnn_dropout: 0.2
+  # Chunk size (in spectrogram frames) used only at test time to avoid OOM
+  # when feeding full sessions. 4000 frames @ 125Hz = ~32 seconds per chunk.
+  test_chunk_frames: 4000
+
+datamodule:
+  _target_: emg2qwerty.lightning.WindowedEMGDataModule
+  window_length: 8000  # 4 sec windows for 2kHz EMG
+  padding: [1800, 200]  # 900ms past context, 100ms future context
+  test_window_length: 8000  # Use windowed test eval to avoid OOM on full sessions

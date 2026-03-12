@@ -1,0 +1,22 @@
+# @package _global_
+# Minimal transforms: no data augmentation. Use this config to measure
+# the contribution of augmentation by comparing against log_spectrogram.yaml.
+to_tensor:
+  _target_: emg2qwerty.transforms.ToTensor
+  fields: [emg_left, emg_right]
+
+logspec:
+  _target_: emg2qwerty.transforms.LogSpectrogram
+  n_fft: 64
+  hop_length: 16
+
+transforms:
+  train:
+    - ${to_tensor}
+    - ${logspec}
+
+  val:
+    - ${to_tensor}
+    - ${logspec}
+
+  test: ${transforms.val}

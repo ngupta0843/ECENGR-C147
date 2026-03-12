@@ -278,3 +278,53 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+
+class CNNEncoder(nn.Module):
+    """A temporal CNN encoder with stacked causal Conv1d blocks for
+    extracting local temporal features from EMG signals.
+
+    Each block consists of Conv1d (no padding, causal) -> BatchNorm1d ->
+    ReLU -> Dropout. The temporal dimension shrinks by (kernel_size - 1)
+    per layer; the caller accounts for this via T_diff in CTC loss.
+
+    Args:
+        num_features (int): Number of input features (last dim of TNC input).
+        channels (int): Number of Conv1d output channels for all layers.
+        kernel_size (int): Temporal kernel size for each Conv1d layer.
+        num_layers (int): Number of Conv1d blocks to stack.
+        dropout (float): Dropout probability after each block.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        channels: int = 256,
+        kernel_size: int = 5,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.out_features = channels
+
+        blocks: list[nn.Module] = []
+        in_ch = num_features
+        for _ in range(num_layers):
+            blocks.append(
+                nn.Sequential(
+                    # No padding: each layer shrinks T by (kernel_size - 1)
+                    nn.Conv1d(in_ch, channels, kernel_size=kernel_size),
+                    nn.BatchNorm1d(channels),
+                    nn.ReLU(),
+                    nn.Dropout(dropout),
+                )
+            )
+            in_ch = channels
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # inputs: (T, N, num_features)
+        x = inputs.permute(1, 2, 0)  # (N, num_features, T)
+        for block in self.blocks:
+            x = block(x)  # (N, channels, T')
+        return x.permute(2, 0, 1)  # (T', N, channels)

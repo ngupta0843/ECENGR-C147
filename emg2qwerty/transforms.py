@@ -243,3 +243,26 @@ class SpecAugment:
 
         # (..., C, freq, T) -> (T, ..., C, freq)
         return x.movedim(-1, 0)
+
+
+@dataclass
+class GaussianNoise:
+    """Applies additive Gaussian noise to a spectrogram tensor for
+    data augmentation. Noise is sampled i.i.d. from N(0, std^2) and
+    added to every element of the input tensor.
+
+    Useful for improving model robustness to signal-level perturbations
+    in sEMG recordings (e.g., electrode contact variation, motion artifact).
+
+    Args:
+        std (float): Standard deviation of the Gaussian noise. (default: 0.1)
+        p (float): Probability of applying the transform per call. (default: 0.5)
+    """
+
+    std: float = 0.1
+    p: float = 0.5
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if np.random.random() < self.p:
+            return tensor + torch.randn_like(tensor) * self.std
+        return tensor
