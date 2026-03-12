@@ -4,6 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import math
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
@@ -135,6 +136,30 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             pin_memory=True,
             persistent_workers=self.num_workers > 0,
         )
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Adds fixed sinusoidal positional encodings to TNC embeddings."""
+
+    def __init__(self, d_model: int, dropout: float) -> None:
+        super().__init__()
+        assert d_model > 0 and d_model % 2 == 0
+        self.d_model = d_model
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.shape[0]
+
+        position = torch.arange(T, device=x.device, dtype=x.dtype).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, self.d_model, 2, device=x.device, dtype=x.dtype)
+            * (-math.log(10000.0) / self.d_model)
+        )
+
+        pe = torch.zeros(T, self.d_model, device=x.device, dtype=x.dtype)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return self.dropout(x + pe.unsqueeze(1))
 
 
 class TDSConvCTCModule(pl.LightningModule):
@@ -292,7 +317,7 @@ class BiLSTMCTCModule(pl.LightningModule):
         num_features = self.NUM_BANDS * mlp_features[-1]
         lstm_dropout = lstm_dropout if lstm_num_layers > 1 else 0.0
 
-        # Feature extractor:
+        
         # inputs: (T, N, bands=2, electrode_channels=16, freq)
         self.spectrogram_norm = SpectrogramNorm(
             channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS
@@ -303,7 +328,7 @@ class BiLSTMCTCModule(pl.LightningModule):
             num_bands=self.NUM_BANDS,
         )
 
-        # Sequence encoder:
+       
         # (T, N, num_features) -> (T, N, 2 * lstm_hidden_size)
         self.encoder = nn.LSTM(
             input_size=num_features,
@@ -313,20 +338,20 @@ class BiLSTMCTCModule(pl.LightningModule):
             bidirectional=True,
         )
 
-        # Classifier:
+        
         # (T, N, 2 * lstm_hidden_size) -> (T, N, num_classes)
         self.classifier = nn.Sequential(
             nn.Linear(2 * lstm_hidden_size, charset().num_classes),
             nn.LogSoftmax(dim=-1),
         )
 
-        # Criterion
+        
         self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
 
-        # Decoder
+        
         self.decoder = instantiate(decoder)
 
-        # Metrics
+        
         metrics = MetricCollection([CharacterErrorRates()])
         self.metrics = nn.ModuleDict(
             {
@@ -336,11 +361,11 @@ class BiLSTMCTCModule(pl.LightningModule):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        x = self.spectrogram_norm(inputs)  # (T, N, bands=2, C=16, freq)
-        x = self.rotation_invariant_mlp(x)  # (T, N, bands=2, mlp_features[-1])
-        x = x.flatten(start_dim=2)  # (T, N, num_features)
-        x, _ = self.encoder(x)  # (T, N, 2 * lstm_hidden_size)
-        return self.classifier(x)  # (T, N, num_classes)
+        x = self.spectrogram_norm(inputs)  
+        x = self.rotation_invariant_mlp(x)  
+        x = x.flatten(start_dim=2) 
+        x, _ = self.encoder(x)  
+        return self.classifier(x)  
 
     def _step(
         self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
@@ -352,6 +377,174 @@ class BiLSTMCTCModule(pl.LightningModule):
         N = len(input_lengths)  # batch_size
 
         emissions = self.forward(inputs)
+
+       
+        T_diff = inputs.shape[0] - emissions.shape[0]
+        emission_lengths = input_lengths - T_diff
+
+        loss = self.ctc_loss(
+            log_probs=emissions,  # (T, N, num_classes)
+            targets=targets.transpose(0, 1),  # (T, N) -> (N, T)
+            input_lengths=emission_lengths,  # (N,)
+            target_lengths=target_lengths,  # (N,)
+        )
+
+        
+        predictions = self.decoder.decode_batch(
+            emissions=emissions.detach().cpu().numpy(),
+            emission_lengths=emission_lengths.detach().cpu().numpy(),
+        )
+
+        
+        metrics = self.metrics[f"{phase}_metrics"]
+        targets = targets.detach().cpu().numpy()
+        target_lengths = target_lengths.detach().cpu().numpy()
+        for i in range(N):
+            
+            target = LabelData.from_labels(targets[: target_lengths[i], i])
+            metrics.update(prediction=predictions[i], target=target)
+
+        self.log(f"{phase}/loss", loss, batch_size=N, sync_dist=True)
+        return loss
+
+    def _epoch_end(self, phase: str) -> None:
+        metrics = self.metrics[f"{phase}_metrics"]
+        self.log_dict(metrics.compute(), sync_dist=True)
+        metrics.reset()
+
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
+
+    def configure_optimizers(self) -> dict[str, Any]:
+        return utils.instantiate_optimizer_and_scheduler(
+            self.parameters(),
+            optimizer_config=self.hparams.optimizer,
+            lr_scheduler_config=self.hparams.lr_scheduler,
+        )
+
+
+class TransformerCTCModule(pl.LightningModule):
+    NUM_BANDS: ClassVar[int] = 2
+    ELECTRODE_CHANNELS: ClassVar[int] = 16
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+
+        # inputs: (T, N, bands=2, electrode_channels=16, freq)
+        self.spectrogram_norm = SpectrogramNorm(
+            channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS
+        )
+        self.rotation_invariant_mlp = MultiBandRotationInvariantMLP(
+            in_features=in_features,
+            mlp_features=mlp_features,
+            num_bands=self.NUM_BANDS,
+        )
+
+        # this is a lightweight projection: per-frame EMG features -> transformer dim
+        self.input_projection = (
+            nn.Identity()
+            if num_features == d_model
+            else nn.Linear(num_features, d_model)
+        )
+        self.position_encoding = SinusoidalPositionalEncoding(
+            d_model=d_model, dropout=dropout
+        )
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="relu",
+            batch_first=False,
+        )
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer=encoder_layer,
+            num_layers=num_layers,
+        )
+
+        # (T, N, d_model) -> (T, N, num_classes)
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+
+        self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
+
+        self.decoder = instantiate(decoder)
+
+        # metrics
+        metrics = MetricCollection([CharacterErrorRates()])
+        self.metrics = nn.ModuleDict(
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
+        )
+
+    @staticmethod
+    def _padding_mask(input_lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+
+        steps = torch.arange(max_len, device=input_lengths.device).unsqueeze(0)
+        return steps >= input_lengths.unsqueeze(1)
+
+    def forward(
+        self, inputs: torch.Tensor, input_lengths: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        x = self.spectrogram_norm(inputs)  
+        x = self.rotation_invariant_mlp(x) 
+        x = x.flatten(start_dim=2)  
+        x = self.input_projection(x) 
+        x = self.position_encoding(x)  
+
+        src_key_padding_mask = None
+        if input_lengths is not None:
+            src_key_padding_mask = self._padding_mask(input_lengths, x.shape[0])
+
+        x = self.encoder(x, src_key_padding_mask=src_key_padding_mask)
+        return self.classifier(x)  # (T, N, num_classes)
+
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        input_lengths = batch["input_lengths"]
+        target_lengths = batch["target_lengths"]
+        N = len(input_lengths)  # batch_size
+
+        emissions = self.forward(inputs, input_lengths=input_lengths)
 
         # Keep this generic in case future variants downsample temporally.
         T_diff = inputs.shape[0] - emissions.shape[0]
